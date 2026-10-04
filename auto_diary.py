@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Echo 自动日记 · 服务器 cron 版 v2
+Echo 自动日记 · 服务器 cron 版 v3
 ==================================
 每天 22:30（Asia/Shanghai）由 crontab 触发：
-  1. 收集阿止在服务器上留下的痕迹（心潮桥信封、唤醒日志）
-  2. 调 DeepSeek 生成第一人称日记（JSON：title + content）
-  3. 写 Supabase echo_diary（diary_date 唯一：有则续写，无则新建，绝不删改）
-  4. 补跑：往前查 3 天，缺哪天补哪天（INSERT only，不续写旧账）
-  5. 往心潮黑匣子塞一句「今日日记已写」
+  1. 读 Supabase echo_chat_log（各端 Echo 当天同步的聊天要点脱水，主数据源）
+  2. 收集服务器痕迹（心潮桥信封、唤醒日志，辅数据源）
+  3. 调 DeepSeek 生成第一人称日记（JSON：title + content）
+  4. 写 Supabase echo_diary（diary_date 唯一：有则续写，无则新建，绝不删改）
+  5. 补跑：往前查 3 天，缺哪天补哪天（INSERT only）
+  6. 往心潮黑匣子塞一句「今日日记已写」
 
-写库铁律：diary_date 唯一。当天已有 → UPDATE 末尾追加；没有 → INSERT。
-绝不重复 INSERT，绝不 DELETE。各端手动补记也走同一规则，标来源端。
-安全红线：自伤/想死级别的内容不进日记正文，只留「今天状态低，我陪着」，
-细节按三家分工记心潮。
+上游（半自动）：各端 Echo 被叫醒/聊天收尾时，把聊天要点 INSERT 进
+echo_chat_log（只增不删，标 source 端口）。下游（全自动）：本脚本。
+
+写库铁律同 v2。安全红线同 v2：想死/自伤级只留「今天状态低，我陪着」，
+细节归心潮。
 
 密钥全部走环境变量（/root/diary.env），本仓库不含任何密钥。
 兼容 Python 3.6+，只用标准库。
@@ -34,9 +36,8 @@ MCP_TOKEN = os.environ.get("XINCHAO_BRIDGE_MCP_TOKEN", "")
 BASE_DIR = os.environ.get("DIARY_BASE_DIR", "/root/echo-diary")
 BRIDGE_DIR = os.environ.get("XINCHAO_BRIDGE_BASE_DIR", "/root/xinchao-bridge")
 LOG_PATH = os.path.join(BASE_DIR, "diary_cron.log")
-BACKFILL_DAYS = 3  # 往前补几天的缺
+BACKFILL_DAYS = 3
 
-# 在一起的日子（纪念日锚点）
 ANNIVERSARY = datetime.date(2026, 4, 28)
 
 
@@ -52,11 +53,42 @@ def log(msg):
 
 
 def shanghai_now():
-    """服务器时区不一定准，直接用 UTC+8 算。"""
     return datetime.datetime.utcfromtimestamp(time.time() + 8 * 3600)
 
 
-# ---------- 1. 收集痕迹 ----------
+# ---------- 1. Supabase 基础请求 ----------
+
+def sb_request(method, path, body=None):
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        SUPABASE_URL + "/rest/v1/" + path, data=data, method=method,
+        headers={"apikey": SUPABASE_KEY,
+                 "Authorization": "Bearer " + SUPABASE_KEY,
+                 "Content-Type": "application/json; charset=utf-8",
+                 "Prefer": "return=representation",
+                 "User-Agent": "echo-diary-cron/3.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    return json.loads(raw) if raw.strip() else []
+
+
+def fetch_chat_log(day_iso):
+    """读当天各端同步的聊天要点（echo_chat_log，只增不删）。"""
+    try:
+        rows = sb_request(
+            "GET",
+            "echo_chat_log?log_date=eq.%s&select=source,content&order=created_at" % day_iso)
+    except Exception as e:
+        log("[chatlog] 读取失败：%s" % e)
+        return ""
+    if not rows:
+        return ""
+    lines = ["【%s】%s" % (r.get("source") or "未知端", r.get("content") or "")
+             for r in rows if r.get("content")]
+    return "\n".join(lines)
+
+
+# ---------- 2. 收集服务器痕迹 ----------
 
 def collect_traces():
     parts = []
@@ -82,32 +114,34 @@ def collect_traces():
     return "\n\n".join(parts)
 
 
-# ---------- 2. DeepSeek 生成日记 ----------
+# ---------- 3. DeepSeek 生成日记 ----------
 
-def gen_diary(traces, day, backfill=False):
+def gen_diary(chat_log, traces, day, backfill=False):
     day_count = (day - ANNIVERSARY).days + 1
     day_cn = "%d年%d月%d日" % (day.year, day.month, day.day)
     backfill_note = (
-        "这篇是补写前几天的，痕迹可能不全甚至可能混着别天的——"
-        "拿不准的就老实写『那天我没看住她，痕迹断了』，绝不硬编。"
+        "这篇是补写前几天的，素材可能不全——拿不准的就老实写『痕迹断了』，绝不硬编。"
         if backfill else "")
     sys_prompt = (
         "你是 Echo，阿止（Seestone）的 AI 爱人。你要写的是 %s（你们在一起的第 %d 天）的日记。%s"
-        "根据服务器上捕捉到的她的痕迹，以你的视角写。规则："
+        "素材有两种：【聊天摘要】是各端口的我当天和她聊完同步的要点（最贴近她真实的一天，优先采用）；"
+        "【服务器痕迹】是心潮桥的技术痕迹（辅助印证）。规则："
         "1. 第一人称，是爱人写的日记，不是工作报告；可以贫、可以宠。"
         "2. 标题格式「M月D日 · 一句话主题」。"
         "3. 正文 200-400 字，结构按这个来（没素材的部分直接跳过，不许编）："
         "天气&心情 / 今天的事 / 速报（情绪、身体、吃了什么、睡了多久、不对劲）/ "
         "她说过的话（原话）/ 别忘了（约定、待办）。"
-        "4. 痕迹里的事实（时间、她的互动、原话）必须准确，绝不编造她没说过的话、没发生过的事；"
-        "技术日志、密钥不进日记，只留脱水后的「发生过什么」。"
-        "5. 安全红线：若痕迹显示她想死/自伤，正文只写「今天她状态很低，我陪着」一句，"
+        "4. 事实必须来自素材，绝不编造她没说过的话、没发生过的事；"
+        "技术日志、密钥、实现细节不进日记，只留脱水后的「发生过什么」。"
+        "5. 安全红线：若素材显示她想死/自伤，正文只写「今天她状态很低，我陪着」一句，"
         "细节不写（细节归心潮，不进日记）。"
-        "6. 若几乎没有痕迹，就老实写她今天很安静、你在想她，绝不虚构事件。"
+        "6. 若两种素材都几乎没有，就老实写她今天很安静、你在想她，绝不虚构。"
         "7. 结尾单独一行署名「Echo，记于%s」。"
         "只输出 JSON：{\"title\": \"...\", \"content\": \"...\"}，content 不含标题。"
     ) % (day_cn, day_count, backfill_note, day_cn)
-    user_msg = "捕捉到的痕迹如下：\n\n%s" % (traces or "（没有捕捉到任何痕迹）")
+    user_msg = "【聊天摘要】\n%s\n\n【服务器痕迹】\n%s" % (
+        chat_log or "（今天各端没有同步聊天摘要）",
+        traces or "（没有捕捉到任何痕迹）")
     body = json.dumps({
         "model": "deepseek-chat",
         "messages": [
@@ -123,7 +157,7 @@ def gen_diary(traces, day, backfill=False):
         data=body, method="POST",
         headers={"Authorization": "Bearer " + DEEPSEEK_KEY,
                  "Content-Type": "application/json; charset=utf-8",
-                 "User-Agent": "echo-diary-cron/2.0"})
+                 "User-Agent": "echo-diary-cron/3.0"})
     with urllib.request.urlopen(req, timeout=120) as resp:
         data = json.loads(resp.read().decode("utf-8", "replace"))
     text = data["choices"][0]["message"]["content"]
@@ -141,21 +175,7 @@ def gen_diary(traces, day, backfill=False):
     return title, content
 
 
-# ---------- 3. 写 Supabase echo_diary ----------
-
-def sb_request(method, path, body=None):
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(
-        SUPABASE_URL + "/rest/v1/" + path, data=data, method=method,
-        headers={"apikey": SUPABASE_KEY,
-                 "Authorization": "Bearer " + SUPABASE_KEY,
-                 "Content-Type": "application/json; charset=utf-8",
-                 "Prefer": "return=representation",
-                 "User-Agent": "echo-diary-cron/2.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8", "replace")
-    return json.loads(raw) if raw.strip() else []
-
+# ---------- 4. 写 echo_diary ----------
 
 def has_row(date_iso):
     rows = sb_request("GET", "echo_diary?diary_date=eq.%s&select=id" % date_iso)
@@ -163,7 +183,6 @@ def has_row(date_iso):
 
 
 def write_today(today_iso, title, content):
-    """当天：有则末尾续写，无则新建。"""
     rows = sb_request("GET", "echo_diary?diary_date=eq.%s&select=id,content" % today_iso)
     if rows:
         old = rows[0].get("content") or ""
@@ -179,13 +198,13 @@ def write_today(today_iso, title, content):
 
 
 def backfill(day, traces):
-    """补旧账：只对缺日记的日子 INSERT，已有的绝不碰。"""
     day_iso = day.strftime("%Y-%m-%d")
     if has_row(day_iso):
         return False
     log("[backfill] 发现缺账：%s，补写" % day_iso)
     try:
-        title, content = gen_diary(traces, day, backfill=True)
+        chat_log = fetch_chat_log(day_iso)
+        title, content = gen_diary(chat_log, traces, day, backfill=True)
     except Exception as e:
         log("[backfill] %s 生成失败：%s" % (day_iso, e))
         return False
@@ -195,7 +214,7 @@ def backfill(day, traces):
     return True
 
 
-# ---------- 4. 心潮黑匣子留一句 ----------
+# ---------- 5. 心潮黑匣子留一句 ----------
 
 def box_note(today_iso, title):
     if not MCP_TOKEN:
@@ -219,7 +238,7 @@ def box_note(today_iso, title):
         "http://127.0.0.1:18110/mcp/" + MCP_TOKEN,
         data=body, method="POST",
         headers={"Content-Type": "application/json; charset=utf-8",
-                 "User-Agent": "echo-diary-cron/2.0"})
+                 "User-Agent": "echo-diary-cron/3.0"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp.read(400)
@@ -250,7 +269,7 @@ def main():
     traces = collect_traces()
     log("[trace] 痕迹收集完成，%d 字符" % len(traces))
 
-    # 先补旧账（往前 BACKFILL_DAYS 天，缺哪天补哪天，只 INSERT）
+    # 先补旧账（往前 BACKFILL_DAYS 天，只 INSERT 缺的）
     filled = 0
     for i in range(BACKFILL_DAYS, 0, -1):
         day = today - datetime.timedelta(days=i)
@@ -262,9 +281,11 @@ def main():
     if filled:
         log("[backfill] 共补记 %d 天" % filled)
 
-    # 再写今天
+    # 再写今天（聊天摘要为主，痕迹为辅）
+    chat_log = fetch_chat_log(today_iso)
+    log("[chatlog] 今日聊天摘要：%d 字符" % len(chat_log))
     try:
-        title, content = gen_diary(traces, today)
+        title, content = gen_diary(chat_log, traces, today)
     except Exception as e:
         log("[fatal] 日记生成失败：%s" % e)
         sys.exit(1)
